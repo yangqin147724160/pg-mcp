@@ -51,12 +51,14 @@ class SQLGenerator:
         context: str | None = None,
         previous_attempt: str | None = None,
         error_feedback: str | None = None,
-    ) -> str:
+    ) -> tuple[str, int | None]:
         """Generate SQL statement from natural language question.
 
         This method sends the question and database schema to OpenAI's API
         and extracts the generated SQL query from the response. It supports
         retry scenarios by accepting previous failed attempts and error feedback.
+        The token usage reported by the OpenAI API is read from
+        `response.usage` and returned alongside the SQL.
 
         Args:
             question: User's natural language question.
@@ -66,7 +68,10 @@ class SQLGenerator:
             error_feedback: Error message from previous attempt (for retry).
 
         Returns:
-            str: Generated SQL query (without trailing semicolon).
+            tuple[str, int | None]: The generated SQL query (without trailing
+                semicolon) and the total token consumption reported by the
+                API (`response.usage.total_tokens`), or None when the API
+                did not provide usage metadata.
 
         Raises:
             LLMError: If generation fails or response is invalid.
@@ -75,12 +80,12 @@ class SQLGenerator:
 
         Example:
             >>> # Initial generation
-            >>> sql = await generator.generate(
+            >>> sql, tokens = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema
             ... )
             >>> # Retry with error feedback
-            >>> sql = await generator.generate(
+            >>> sql, tokens = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema,
             ...     previous_attempt="SELECT COUNT(*) FROM user",
@@ -149,7 +154,16 @@ class SQLGenerator:
                 details={"content": content},
             )
 
-        return sql
+        # Read token usage reported by the API (None when unavailable,
+        # e.g. some proxies omit the usage object).
+        tokens_used: int | None = None
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            total_tokens = getattr(usage, "total_tokens", None)
+            if isinstance(total_tokens, int) and total_tokens >= 0:
+                tokens_used = total_tokens
+
+        return sql, tokens_used
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.

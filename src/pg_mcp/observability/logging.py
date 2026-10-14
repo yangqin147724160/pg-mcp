@@ -153,9 +153,15 @@ class JSONFormatter(logging.Formatter):
             "line": record.lineno,
         }
 
-        # Add request_id if present
-        if hasattr(record, "request_id"):
-            log_data["request_id"] = record.request_id
+        # Add request_id if present: prefer the explicit record attribute,
+        # fall back to the ambient tracing context (request_context()).
+        request_id = getattr(record, "request_id", None)
+        if request_id is None:
+            from pg_mcp.observability.tracing import get_request_id
+
+            request_id = get_request_id()
+        if request_id:
+            log_data["request_id"] = request_id
 
         # Add exception info if present
         if record.exc_info:

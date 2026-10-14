@@ -13,13 +13,19 @@ from asyncpg import Pool
 logger = logging.getLogger(__name__)
 
 
-async def create_pool(dsn: str, min_size: int = 5, max_size: int = 20) -> Pool:
+async def create_pool(
+    dsn: str,
+    min_size: int = 5,
+    max_size: int = 20,
+    command_timeout: float = 30,
+) -> Pool:
     """Create a new asyncpg connection pool.
 
     Args:
         dsn: Data Source Name string for the PostgreSQL connection.
         min_size: Minimum number of connections in the pool.
         max_size: Maximum number of connections in the pool.
+        command_timeout: Command execution timeout in seconds.
 
     Returns:
         An asyncpg Pool instance.
@@ -28,7 +34,7 @@ async def create_pool(dsn: str, min_size: int = 5, max_size: int = 20) -> Pool:
         dsn=dsn,
         min_size=min_size,
         max_size=max_size,
-        command_timeout=30,
+        command_timeout=command_timeout,
     )
     logger.info(f"Created connection pool with dsn={dsn[:50]}...")
     return pool

@@ -21,6 +21,8 @@ from pg_mcp.models.query import (
     ReturnType,
 )
 from pg_mcp.models.schema import ColumnInfo, DatabaseSchema, TableInfo
+from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import get_request_id
 from pg_mcp.resilience.circuit_breaker import CircuitState
 from pg_mcp.services.orchestrator import QueryOrchestrator
 
@@ -144,7 +146,7 @@ class TestSQLGenerationWithRetry:
         """Test successful SQL generation on first attempt."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = ("SELECT * FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None  # No exception = valid
@@ -156,7 +158,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=3),
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -182,8 +184,8 @@ class TestSQLGenerationWithRetry:
         # Setup mocks - first attempt fails validation, second succeeds
         mock_generator = AsyncMock()
         mock_generator.generate.side_effect = [
-            "SELECT * FROM user;",  # First attempt (wrong table name)
-            "SELECT * FROM users;",  # Second attempt (correct)
+            ("SELECT * FROM user;", 51),  # First attempt (wrong table name)
+            ("SELECT * FROM users;", 78),  # Second attempt (correct)
         ]
 
         mock_validator = MagicMock()
@@ -200,7 +202,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=3),
+            resilience_config=ResilienceConfig(max_retries=3, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -227,7 +229,7 @@ class TestSQLGenerationWithRetry:
         """Test failure after exhausting all retries."""
         # Setup mocks - all attempts fail validation
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "DELETE FROM users;"
+        mock_generator.generate.return_value = ("DELETE FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.side_effect = SecurityViolationError(
@@ -241,7 +243,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=2),
+            resilience_config=ResilienceConfig(max_retries=2, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -300,7 +302,7 @@ class TestSQLGenerationWithRetry:
             result_validator=MagicMock(),
             schema_cache=MagicMock(),
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=1),
+            resilience_config=ResilienceConfig(max_retries=1, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -442,7 +444,7 @@ class TestExecuteQueryFlow:
         """Test executing query with return_type=SQL."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = ("SELECT * FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
@@ -482,7 +484,7 @@ class TestExecuteQueryFlow:
         """Test executing query with return_type=RESULT."""
         # Setup mocks
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT id, name FROM users;"
+        mock_generator.generate.return_value = ("SELECT id, name FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
@@ -551,7 +553,7 @@ class TestExecuteQueryFlow:
         mock_cache.load = AsyncMock(return_value=mock_schema)
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT 1;"
+        mock_generator.generate.return_value = ("SELECT 1;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
@@ -628,7 +630,7 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "DELETE FROM users;"
+        mock_generator.generate.return_value = ("DELETE FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.side_effect = SecurityViolationError("DELETE not allowed")
@@ -640,7 +642,7 @@ class TestExecuteQueryFlow:
             result_validator=MagicMock(),
             schema_cache=mock_cache,
             pools={"test_db": MagicMock()},
-            resilience_config=ResilienceConfig(max_retries=1),
+            resilience_config=ResilienceConfig(max_retries=1, retry_delay=0.1),
             validation_config=ValidationConfig(),
         )
 
@@ -666,7 +668,7 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT * FROM users;"
+        mock_generator.generate.return_value = ("SELECT * FROM users;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
@@ -739,7 +741,7 @@ class TestExecuteQueryFlow:
         mock_cache.get.return_value = mock_schema
 
         mock_generator = AsyncMock()
-        mock_generator.generate.return_value = "SELECT 1;"
+        mock_generator.generate.return_value = ("SELECT 1;", 55)
 
         mock_validator = MagicMock()
         mock_validator.validate_or_raise.return_value = None
@@ -767,3 +769,155 @@ class TestExecuteQueryFlow:
         assert response.success is True
         # Verify schema was fetched for auto-selected database
         mock_cache.get.assert_called_once_with("only_db")
+
+
+class TestMetricsAndTracingWiring:
+    """Verify orchestrator wires metrics, tracing and token accounting."""
+
+    def _mock_schema(self) -> DatabaseSchema:
+        """Small schema mock reused across tests."""
+        return DatabaseSchema(
+            database_name="test_db",
+            tables=[
+                TableInfo(
+                    schema_name="public",
+                    table_name="users",
+                    columns=[
+                        ColumnInfo(name="id", data_type="integer", is_nullable=False),
+                    ],
+                )
+            ],
+            version="15.0",
+        )
+
+    def _make_orchestrator(
+        self,
+        mock_schema: DatabaseSchema,
+        metrics: MetricsCollector | None,
+        **resilience_kwargs: object,
+    ) -> tuple[QueryOrchestrator, AsyncMock, AsyncMock, MagicMock]:
+        """Build orchestrator with mocked generator/executor/result validator."""
+        mock_cache = MagicMock()
+        mock_cache.get.return_value = mock_schema
+
+        mock_generator = AsyncMock()
+        mock_generator.generate.return_value = ("SELECT 1;", 42)
+
+        mock_validator = MagicMock()
+        mock_validator.validate_or_raise.return_value = None
+
+        mock_executor = AsyncMock()
+        mock_executor.execute.return_value = ([{"one": 1}], 1)
+
+        mock_result_validator = AsyncMock()
+        mock_result_validator.validate.return_value = ResultValidationResult(
+            confidence=90, explanation="ok", suggestion=None, is_acceptable=True
+        )
+
+        orchestrator = QueryOrchestrator(
+            sql_generator=mock_generator,
+            sql_validator=mock_validator,
+            sql_executor=mock_executor,
+            result_validator=mock_result_validator,
+            schema_cache=mock_cache,
+            pools={"test_db": MagicMock()},
+            resilience_config=ResilienceConfig(**resilience_kwargs),
+            validation_config=ValidationConfig(),
+            metrics=metrics,
+        )
+        return orchestrator, mock_generator, mock_executor, mock_validator
+
+    @pytest.mark.asyncio
+    async def test_tokens_used_flows_to_response(self) -> None:
+        """generate() token usage must surface in QueryResponse.tokens_used."""
+        mock_schema = self._mock_schema()
+        orchestrator, _gen, _exec, _val = self._make_orchestrator(mock_schema, metrics=None)
+
+        request = QueryRequest(question="Test", database="test_db")
+        response = await orchestrator.execute_query(request)
+
+        assert response.success is True
+        assert response.tokens_used == 42
+        # SQL-only early return also carries tokens
+        request_sql = QueryRequest(question="Test", database="test_db", return_type=ReturnType.SQL)
+        response_sql = await orchestrator.execute_query(request_sql)
+        assert response_sql.tokens_used == 42
+
+    @pytest.mark.asyncio
+    async def test_metrics_increment_query_request(self) -> None:
+        """Success/failure responses increment the Prometheus request counter."""
+        mock_schema = self._mock_schema()
+        metrics = MetricsCollector()
+
+        before = metrics.query_requests.labels(
+            status="success", database="test_db"
+        )._value.get()
+
+        orchestrator, _gen, _exec, _val = self._make_orchestrator(mock_schema, metrics=metrics)
+        request = QueryRequest(question="Test", database="test_db")
+        response = await orchestrator.execute_query(request)
+
+        assert response.success is True
+        after = metrics.query_requests.labels(status="success", database="test_db")._value.get()
+        assert after == before + 1
+        # total duration histogram observed (sum increases)
+        assert metrics.query_duration._sum.get() > 0
+
+    @pytest.mark.asyncio
+    async def test_metrics_on_validation_failure_rejected(self) -> None:
+        """Security rejections count into both request(error) and sql_rejected."""
+        mock_schema = self._mock_schema()
+        metrics = MetricsCollector()
+
+        rejected_before = metrics.sql_rejected.labels(
+            reason="security_violation"
+        )._value.get()
+        error_before = metrics.query_requests.labels(
+            status="error", database="test_db"
+        )._value.get()
+
+        orchestrator, _gen, _exec, mock_validator = self._make_orchestrator(
+            mock_schema, metrics=metrics, max_retries=0, retry_delay=0.1
+        )
+        mock_validator.validate_or_raise.side_effect = SecurityViolationError(
+            "DELETE not allowed"
+        )
+
+        request = QueryRequest(question="Delete everything", database="test_db")
+        response = await orchestrator.execute_query(request)
+
+        assert response.success is False
+        assert response.error is not None
+        assert response.error.code == "security_violation"
+
+        rejected_after = metrics.sql_rejected.labels(
+            reason="security_violation"
+        )._value.get()
+        error_after = metrics.query_requests.labels(
+            status="error", database="test_db"
+        )._value.get()
+        assert rejected_after == rejected_before + 1
+        assert error_after == error_before + 1
+
+    @pytest.mark.asyncio
+    async def test_request_context_cleans_up(self) -> None:
+        """execute_query leaves no ambient request_id behind after completion."""
+        mock_schema = self._mock_schema()
+        orchestrator, _gen, _exec, _val = self._make_orchestrator(mock_schema, metrics=None)
+
+        request = QueryRequest(question="Test", database="test_db")
+        response = await orchestrator.execute_query(request)
+        assert response.success is True
+        assert get_request_id() is None
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_records_success(self) -> None:
+        """Successful generation is recorded into the circuit breaker."""
+        mock_schema = self._mock_schema()
+        orchestrator, _gen, _exec, _val = self._make_orchestrator(mock_schema, metrics=None)
+
+        request = QueryRequest(question="Test", database="test_db")
+        response = await orchestrator.execute_query(request)
+        assert response.success is True
+        assert orchestrator.circuit_breaker.state == CircuitState.CLOSED
+        assert orchestrator.circuit_breaker.failure_count == 0

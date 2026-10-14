@@ -5,7 +5,8 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+import json
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -88,6 +89,17 @@ class SecurityConfig(BaseSettings):
         ],
         description="List of blocked PostgreSQL functions",
     )
+    blocked_tables: list[str] = Field(
+        default_factory=list,
+        description="List of table names that queries must not access",
+    )
+    blocked_columns: list[str] = Field(
+        default_factory=list,
+        description="Column names (optionally schema.table.column) that queries must not access",
+    )
+    allow_explain: bool = Field(
+        default=False, description="Allow EXPLAIN statements in addition to SELECT"
+    )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
         default=30.0, ge=1.0, le=300.0, description="Maximum query execution time in seconds"
@@ -99,7 +111,7 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
     def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
         """Parse comma-separated string or list."""
@@ -157,6 +169,7 @@ class ResilienceConfig(BaseSettings):
     backoff_factor: float = Field(
         default=2.0, ge=1.0, le=10.0, description="Exponential backoff factor"
     )
+    retry_enabled: bool = Field(default=True, description="Enable retry with backoff")
     circuit_breaker_threshold: int = Field(
         default=5, ge=1, le=100, description="Failures before circuit opens"
     )
@@ -193,7 +206,18 @@ class ObservabilityConfig(BaseSettings):
 
 
 class Settings(BaseSettings):
-    """Main application settings aggregating all config sections."""
+    """Main application settings aggregating all config sections.
+
+    Supports both single-database (legacy `DATABASE_*` variables) and
+    multi-database configurations:
+
+    - Legacy: `DATABASE_HOST=... DATABASE_NAME=app` (single database).
+    - Multi-database: `DATABASES='{"app": {"host": "...", "name": "app",
+      "user": "...", "password": "..."}, "analytics": {"host": "..."}}'`
+
+    When `databases` is not provided, the single `database` config is exposed
+    as the `database_configs` mapping under its own name.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -206,14 +230,69 @@ class Settings(BaseSettings):
         default="development", description="Application environment"
     )
 
+    # Optional multi-database configuration (JSON object mapping database
+    # name -> DatabaseConfig fields). When unset, falls back to the single
+    # `database` configuration below.
+    databases: dict[str, DatabaseConfig] | None = Field(
+        default=None,
+        description=(
+            "Optional multi-database configs as a JSON object mapping database "
+            "name to its DatabaseConfig fields (e.g. DATABASES=...)"
+        ),
+    )
+
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    @field_validator("databases", mode="before")
+    @classmethod
+    def parse_databases(cls, v: Any) -> Any:
+        """Parse DATABASES string or normalize dict values.
+
+        Accepts either a JSON string of `{name: config_dict}` or an already
+        constructed mapping. Explicit values take precedence over the
+        `DATABASE_*` environment variables inside each DatabaseConfig.
+        """
+        if v is None:
+            return None
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"DATABASES is not valid JSON: {e}") from e
+        if not isinstance(v, dict) or not v:
+            raise ValueError(
+                "databases must be a non-empty object mapping database name to config"
+            )
+        parsed: dict[str, DatabaseConfig] = {}
+        for name, cfg in v.items():
+            if isinstance(cfg, DatabaseConfig):
+                parsed[str(name)] = cfg
+            elif isinstance(cfg, dict):
+                parsed[str(name)] = DatabaseConfig(**cfg)
+            else:
+                raise ValueError(
+                    f"databases['{name}'] must be an object with DatabaseConfig fields"
+                )
+        return parsed
+
+    @property
+    def database_configs(self) -> dict[str, DatabaseConfig]:
+        """Mapping of configured databases in uniform `{name: DatabaseConfig}` form.
+
+        Falls back to the single legacy `database` configuration when no
+        explicit multi-database configuration was provided.
+        """
+        if self.databases:
+            return self.databases
+        return {self.database.name: self.database}
 
     @property
     def is_production(self) -> bool:
